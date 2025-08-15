@@ -1,6 +1,0 @@
-date,pattern_present,trade_direction,outcome_tp1_hit,outcome_tp2_hit,outcome_sl_hit
-2024-07-15,1,1,1,1,0
-2024-07-16,0,0,0,0,0
-2024-07-17,1,-1,1,0,1
-2024-07-18,0,0,0,0,0
-2024-07-19,1,1,1,0,0

@@ -3,6 +3,8 @@ import subprocess
 import re
 from datetime import datetime
 import pytz
+from plyer import notification
+import sys
 
 # --- 1. Configuration: Adjust these rules to match your trading plan ---
 
@@ -14,41 +16,77 @@ TIMEZONE = 'America/Los_Angeles'
 # Define the rules for a valid alert
 MIN_QUALITY = 4       # Minimum star rating (1-5)
 MAX_SL_PROB = 0.30    # Maximum Stop Loss Probability (e.g., 0.30 for 30%)
-MIN_RR = 2.0          # Minimum predicted Reward:Risk ratio
+MIN_RR = 2.5          # Minimum predicted Reward:Risk ratio
 
 # Define how often to check the market (in seconds)
 SLEEP_INTERVAL_ACTIVE = 300  # 5 minutes
-SLEEP_INTERVAL_INACTIVE = 600 # 10 minutes
+SLEEP_INTERVAL_INACTIVE = 900 # 15 minutes
 
-# --- 2. The Alert Engine ---
+# --- 2. The Live Assistant Engine ---
 
 def parse_inference_output(output_text):
     """
-    Parses the text output from the inference script to extract key values.
+    Parses the full text output from the inference script to extract all key values.
     Returns a dictionary of the parsed values or None if parsing fails.
     """
     try:
-        # Using regular expressions to find the numbers after the labels
+        # Using regular expressions to find the numbers and text after the labels
+        direction_bias = float(re.search(r"Direction Bias:\s*(-?[\d\.]+)", output_text).group(1))
+        direction_text = re.search(r"Direction Bias:.*?\((.*?)\)", output_text).group(1)
         quality = int(re.search(r"Predicted Quality:\s*(\d+)", output_text).group(1))
         rr = float(re.search(r"Predicted R:R:\s*([\d\.]+)", output_text).group(1))
         sl_prob = float(re.search(r"SL Hit Probability:\s*([\d\.]+)%", output_text).group(1)) / 100.0
         
+        entry = float(re.search(r"Entry Price:\s*~\s*([\d\.]+)", output_text).group(1))
+        sl = float(re.search(r"Stop Loss:\s*~\s*([\d\.]+)", output_text).group(1))
+        tp = float(re.search(r"Take Profit:\s*~\s*([\d\.]+)", output_text).group(1))
+        
+        sl_reason = re.search(r"Stop Loss:.*?\((.*?)\)", output_text).group(1)
+
         return {
-            "quality": quality,
-            "rr": rr,
-            "sl_prob": sl_prob
+            "direction_bias": direction_bias, "direction_text": direction_text,
+            "quality": quality, "rr": rr, "sl_prob": sl_prob,
+            "entry": entry, "sl": sl, "tp": tp, "sl_reason": sl_reason
         }
-    except (AttributeError, IndexError, ValueError) as e:
-        print(f"  -> Warning: Could not parse inference output. Error: {e}")
+    except (AttributeError, IndexError, ValueError):
+        # This can happen if the inference output is not as expected
         return None
 
-def run_alert_engine():
+def format_alert_message(data):
+    """Takes the parsed data and formats it for the notification body."""
+    title = f"{data['quality']}-Star GBP/JPY {data['direction_text']} Setup Detected!"
+    
+    message = (
+        f"Predicted R:R: {data['rr']:.2f}\n"
+        f"SL Hit Probability: {data['sl_prob']:.1%}\n"
+        f"-------------------------------------\n"
+        f"Entry:  ~{data['entry']:.5f}\n"
+        f"SL:     ~{data['sl']:.5f} ({data['sl_reason']})\n"
+        f"TP:     ~{data['tp']:.5f}"
+    )
+    return title, message
+
+def send_desktop_notification(title, message):
+    """Sends a cross-platform desktop notification."""
+    try:
+        notification.notify(
+            title=title,
+            message=message,
+            app_name='GBP/JPY Trading Assistant',
+            timeout=20  # Notification will stay for 20 seconds
+        )
+        print("  -> Notification Sent!")
+    except Exception as e:
+        print(f"  -> Error sending notification: {e}")
+        print("  -> Please ensure you have a notification backend installed for your OS.")
+
+def run_live_assistant():
     """
     The main loop that runs the assistant, checks for setups, and sends alerts.
     """
-    print("--- GBP/JPY Trading Assistant ---")
+    print("--- GBP/JPY Live Trading Assistant ---")
     print(f"Alert Rules: Quality >= {MIN_QUALITY} Stars | R:R >= {MIN_RR} | SL Prob <= {MAX_SL_PROB*100}%")
-    print("Assistant activated. Monitoring for trading session...")
+    print("Assistant activated. Monitoring for trading session... (Press Ctrl+C to stop)")
     
     alert_sent_for_current_setup = False
 
@@ -64,28 +102,26 @@ def run_alert_engine():
             if is_trading_session:
                 print(f"\n[{current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}] Active Session: Running check...")
                 
+                # Determine the correct python executable to run subprocesses
+                python_executable = sys.executable
+                
                 # Run the inference script as a separate process
                 process = subprocess.run(
-                    ['python', 'src/run_assistant.py', 'infer'],
+                    [python_executable, 'src/run_assistant.py', 'infer'],
                     capture_output=True,
                     text=True,
-                    check=False # Don't throw an error if the script fails
+                    check=False
                 )
                 
                 if process.returncode != 0:
                     print("  -> Error: Inference script failed to run.")
-                    print(process.stderr)
                 else:
-                    # The full output from the inference script
                     inference_output = process.stdout
-                    
-                    # Parse the output to get the numeric predictions
                     parsed_data = parse_inference_output(inference_output)
                     
                     if parsed_data:
-                        print(f"  -> Analysis Complete: Quality={parsed_data['quality']}*, R:R={parsed_data['rr']:.2f}, SL%={parsed_data['sl_prob']:.2%}")
+                        print(f"  -> Analysis Complete: Quality={parsed_data['quality']}*, R:R={parsed_data['rr']:.2f}, SL%={parsed_data['sl_prob']:.1%}")
                         
-                        # Check if the results meet our alert criteria
                         is_high_quality_setup = (
                             parsed_data['quality'] >= MIN_QUALITY and
                             parsed_data['rr'] >= MIN_RR and
@@ -93,25 +129,20 @@ def run_alert_engine():
                         )
                         
                         if is_high_quality_setup and not alert_sent_for_current_setup:
-                            print("\n" + "!"*60)
-                            print("!!! HIGH-QUALITY TRADING SETUP DETECTED !!!")
-                            print("!"*60)
-                            # Print the full, detailed output from the inference script
-                            print(inference_output)
-                            alert_sent_for_current_setup = True # Set the flag to prevent re-alerting
+                            print("  -> !!! HIGH-QUALITY SETUP DETECTED !!!")
+                            title, message = format_alert_message(parsed_data)
+                            send_desktop_notification(title, message)
+                            alert_sent_for_current_setup = True
                         
                         elif not is_high_quality_setup:
                             if alert_sent_for_current_setup:
                                 print("  -> Previous setup is no longer valid. Resetting alert status.")
-                            # Reset the flag if the setup is no longer valid
                             alert_sent_for_current_setup = False
                 
-                print(f"  -> Sleeping for {SLEEP_INTERVAL_ACTIVE // 60} minutes...")
                 time.sleep(SLEEP_INTERVAL_ACTIVE)
 
             else: # If not in trading session
                 print(f"[{current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}] Inactive Session: Sleeping...")
-                # Reset the alert flag during inactive hours
                 alert_sent_for_current_setup = False
                 time.sleep(SLEEP_INTERVAL_INACTIVE)
 
@@ -124,4 +155,4 @@ def run_alert_engine():
             time.sleep(60)
 
 if __name__ == '__main__':
-    run_alert_engine()
+    run_live_assistant()
