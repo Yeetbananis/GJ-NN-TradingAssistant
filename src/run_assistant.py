@@ -1,3 +1,4 @@
+from pyexpat import model
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
@@ -313,6 +314,7 @@ def do_inference():
 
     # 4. Prediction
     prediction_tensor = model(input_tensor)
+        
     
     # 5. SHAP Explanation
     print("Calculating SHAP values...")

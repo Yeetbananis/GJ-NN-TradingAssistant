@@ -3,22 +3,17 @@ import subprocess
 import re
 from datetime import datetime
 import pytz
+from plyer import notification
 
 # --- 1. Configuration: Adjust these rules to match your trading plan ---
-
-# Define your trading session in Pacific Time
-TRADING_START_HOUR = 21  # 9 PM
-TRADING_END_HOUR = 1     # 1 AM (The script handles the overnight crossover)
+TRADING_START_HOUR = 21
+TRADING_END_HOUR = 1
 TIMEZONE = 'America/Los_Angeles'
-
-# Define the rules for a valid alert
-MIN_QUALITY = 4       # Minimum star rating (1-5)
-MAX_SL_PROB = 0.30    # Maximum Stop Loss Probability (e.g., 0.30 for 30%)
-MIN_RR = 2.0          # Minimum predicted Reward:Risk ratio
-
-# Define how often to check the market (in seconds)
-SLEEP_INTERVAL_ACTIVE = 300  # 5 minutes
-SLEEP_INTERVAL_INACTIVE = 600 # 10 minutes
+MIN_QUALITY = 4
+MAX_SL_PROB = 0.30
+MIN_RR = 2.0
+SLEEP_INTERVAL_ACTIVE = 300
+SLEEP_INTERVAL_INACTIVE = 600
 
 # --- 2. The Alert Engine ---
 
@@ -28,15 +23,23 @@ def parse_inference_output(output_text):
     Returns a dictionary of the parsed values or None if parsing fails.
     """
     try:
-        # Using regular expressions to find the numbers after the labels
+        direction_text = re.search(r"Direction Bias:.*?\((.*?)\)", output_text).group(1)
         quality = int(re.search(r"Predicted Quality:\s*(\d+)", output_text).group(1))
         rr = float(re.search(r"Predicted R:R:\s*([\d\.]+)", output_text).group(1))
         sl_prob = float(re.search(r"SL Hit Probability:\s*([\d\.]+)%", output_text).group(1)) / 100.0
-        
+        entry = float(re.search(r"Entry Price:\s*~\s*([\d\.]+)", output_text).group(1))
+        sl = float(re.search(r"Stop Loss:\s*~\s*([\d\.]+)", output_text).group(1))
+        tp = float(re.search(r"Take Profit:\s*~\s*([\d\.]+)", output_text).group(1))
+        sl_reason = re.search(r"Stop Loss:.*?\((.*?)\)", output_text).group(1)
         return {
+            "direction_text": direction_text,
             "quality": quality,
             "rr": rr,
-            "sl_prob": sl_prob
+            "sl_prob": sl_prob,
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "sl_reason": sl_reason
         }
     except (AttributeError, IndexError, ValueError) as e:
         print(f"  -> Warning: Could not parse inference output. Error: {e}")
@@ -54,7 +57,6 @@ def run_alert_engine():
 
     while True:
         try:
-            # Check if it's currently within the trading session
             tz = pytz.timezone(TIMEZONE)
             current_time = datetime.now(tz)
             current_hour = current_time.hour
@@ -64,28 +66,23 @@ def run_alert_engine():
             if is_trading_session:
                 print(f"\n[{current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}] Active Session: Running check...")
                 
-                # Run the inference script as a separate process
                 process = subprocess.run(
                     ['python', 'src/run_assistant.py', 'infer'],
                     capture_output=True,
                     text=True,
-                    check=False # Don't throw an error if the script fails
+                    check=False
                 )
                 
                 if process.returncode != 0:
                     print("  -> Error: Inference script failed to run.")
                     print(process.stderr)
                 else:
-                    # The full output from the inference script
                     inference_output = process.stdout
-                    
-                    # Parse the output to get the numeric predictions
                     parsed_data = parse_inference_output(inference_output)
                     
                     if parsed_data:
                         print(f"  -> Analysis Complete: Quality={parsed_data['quality']}*, R:R={parsed_data['rr']:.2f}, SL%={parsed_data['sl_prob']:.2%}")
                         
-                        # Check if the results meet our alert criteria
                         is_high_quality_setup = (
                             parsed_data['quality'] >= MIN_QUALITY and
                             parsed_data['rr'] >= MIN_RR and
@@ -96,22 +93,19 @@ def run_alert_engine():
                             print("\n" + "!"*60)
                             print("!!! HIGH-QUALITY TRADING SETUP DETECTED !!!")
                             print("!"*60)
-                            # Print the full, detailed output from the inference script
                             print(inference_output)
-                            alert_sent_for_current_setup = True # Set the flag to prevent re-alerting
+                            alert_sent_for_current_setup = True
                         
                         elif not is_high_quality_setup:
                             if alert_sent_for_current_setup:
                                 print("  -> Previous setup is no longer valid. Resetting alert status.")
-                            # Reset the flag if the setup is no longer valid
                             alert_sent_for_current_setup = False
                 
                 print(f"  -> Sleeping for {SLEEP_INTERVAL_ACTIVE // 60} minutes...")
                 time.sleep(SLEEP_INTERVAL_ACTIVE)
 
-            else: # If not in trading session
+            else:
                 print(f"[{current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}] Inactive Session: Sleeping...")
-                # Reset the alert flag during inactive hours
                 alert_sent_for_current_setup = False
                 time.sleep(SLEEP_INTERVAL_INACTIVE)
 

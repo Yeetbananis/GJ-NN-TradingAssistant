@@ -10,3 +10,4 @@ tqdm
 plyer
 gymnasium
 stable-baselines3
+oandapyV20
