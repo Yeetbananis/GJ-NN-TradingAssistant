@@ -8,3 +8,5 @@ matplotlib
 shap
 tqdm
 plyer
+gymnasium
+stable-baselines3
