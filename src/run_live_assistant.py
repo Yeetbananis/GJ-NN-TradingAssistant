@@ -30,8 +30,8 @@ RISK_PER_TRADE_PERCENT = 0.01  # Risk 1% of the account per trade
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PREDICTION_LOG_FILE = PROJECT_ROOT / "prediction_log.csv"
 RL_MODEL_PATH = PROJECT_ROOT / "models/rl_trade_manager.zip"
-TRADING_START_HOUR = 21  # 1 PM PDT for testing is 13
-TRADING_END_HOUR = 1   # 3 PM PDT for testing is 15
+TRADING_START_HOUR = 21 
+TRADING_END_HOUR = 1
 TIMEZONE = 'America/Los_Angeles'
 MIN_QUALITY = 4
 MAX_SL_PROB = 0.30
@@ -41,7 +41,13 @@ SLEEP_INTERVAL_INACTIVE = 900
 DATA_CACHE_1H = PROJECT_ROOT / "data/cache/GBPJPY=X_1h_cache.csv"
 DATA_CACHE_5M = PROJECT_ROOT / "data/cache/GBPJPY=X_5m_cache.csv"
 
+# --- NEW: State Management Files for Telegram Control ---
+TELEGRAM_MODE_FILE = PROJECT_ROOT / "telegram_mode.txt"
+LAST_UPDATE_ID_FILE = PROJECT_ROOT / "last_update_id.txt"
+
+
 # --- 3. Telegram Setup ---
+# --- MODIFIED: PrintLogger is now mode-aware ---
 class PrintLogger:
     def __init__(self, bot_token, chat_id):
         self.bot_token = bot_token
@@ -50,7 +56,6 @@ class PrintLogger:
         self.last_sent = time.time()
 
     def escape_markdown(self, text):
-        """Escape special Markdown characters to prevent BadRequest errors."""
         escape_chars = ['*', '_', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
         for char in escape_chars:
             text = text.replace(char, f'\\{char}')
@@ -73,34 +78,40 @@ class PrintLogger:
         response.raise_for_status()
         return response.json()
 
-    def write(self, message):
-        sys.__stdout__.write(message)  # Print to terminal
-        if message.strip():
-            self.message_queue.put(message.strip())
-            if time.time() - self.last_sent >= 5:  # Send every 5 seconds
-                messages = []
+    def _send_queued_messages(self):
+        """Internal method to send queued messages, respecting the current mode."""
+        # Gatekeeping: only send if mode is 'all' and queue is not empty.
+        if get_telegram_mode() != 'all' or self.message_queue.empty():
+            # If mode is 'important', clear the queue to prevent old messages from being sent on mode switch
+            if get_telegram_mode() == 'important':
                 while not self.message_queue.empty():
-                    messages.append(self.message_queue.get())
-                if messages:
-                    message_to_send = "\n".join(messages)
-                    try:
-                        self.send_message(message_to_send)
-                        self.last_sent = time.time()
-                    except Exception as e:
-                        logging.error(f"Failed to send Telegram message: {e}")
+                    self.message_queue.get()
+            return
 
-    def flush(self):
-        sys.__stdout__.flush()
-        if time.time() - self.last_sent >= 5 and not self.message_queue.empty():
-            messages = []
-            while not self.message_queue.empty():
-                messages.append(self.message_queue.get())
+        messages = []
+        while not self.message_queue.empty():
+            messages.append(self.message_queue.get())
+        
+        if messages:
             message_to_send = "\n".join(messages)
             try:
                 self.send_message(message_to_send)
                 self.last_sent = time.time()
             except Exception as e:
                 logging.error(f"Failed to send Telegram message: {e}")
+
+    def write(self, message):
+        sys.__stdout__.write(message)  # Always print to the actual terminal
+        if message.strip():
+            self.message_queue.put(message.strip())
+        
+        if time.time() - self.last_sent >= 5:
+            self._send_queued_messages()
+
+    def flush(self):
+        sys.__stdout__.flush()
+        self._send_queued_messages()
+
 
 # Initialize Telegram logger
 try:
@@ -113,7 +124,78 @@ try:
 except Exception as e:
     print(f"WARNING: Could not initialize Telegram logger: {e}. Using console output only.")
 
+
 # --- 4. Helper Functions ---
+
+# --- NEW: Functions to manage Telegram mode and process commands ---
+def get_telegram_mode():
+    """Reads the current notification mode from a file. Defaults to 'all'."""
+    try:
+        with open(TELEGRAM_MODE_FILE, 'r') as f:
+            mode = f.read().strip()
+            return mode if mode in ['all', 'important'] else 'all'
+    except FileNotFoundError:
+        return 'all'
+
+def set_telegram_mode(mode):
+    """Saves the desired notification mode to a file."""
+    if mode in ['all', 'important']:
+        with open(TELEGRAM_MODE_FILE, 'w') as f:
+            f.write(mode)
+        print(f"  -> Telegram notification mode set to: {mode}")
+
+def get_last_update_id():
+    """Retrieves the last processed update_id from a file."""
+    try:
+        with open(LAST_UPDATE_ID_FILE, 'r') as f:
+            return int(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+def save_last_update_id(update_id):
+    """Saves the latest processed update_id to a file."""
+    with open(LAST_UPDATE_ID_FILE, 'w') as f:
+        f.write(str(update_id))
+
+@retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, max=5), retry=retry_if_exception_type(requests.exceptions.RequestException))
+def process_telegram_commands():
+    """Polls Telegram for new commands and updates the mode accordingly."""
+    last_update_id = get_last_update_id()
+    offset = last_update_id + 1 if last_update_id else None
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {'timeout': 10, 'offset': offset, 'allowed_updates': ['message']}
+    
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        response.raise_for_status()
+        updates = response.json().get('result', [])
+
+        if not updates:
+            return
+
+        max_update_id = last_update_id if last_update_id else 0
+        for update in updates:
+            max_update_id = max(max_update_id, update['update_id'])
+            if 'message' in update and 'text' in update['message']:
+                message_text = update['message']['text'].strip()
+                chat_id = update['message']['chat']['id']
+                
+                # Security check: only process commands from the configured chat_id
+                if str(chat_id) == str(TELEGRAM_CHAT_ID):
+                    if message_text == '/importantnotis':
+                        set_telegram_mode('important')
+                    elif message_text == '/allnotis':
+                        set_telegram_mode('all')
+        
+        save_last_update_id(max_update_id)
+
+    except requests.exceptions.RequestException as e:
+        # This will be printed to terminal but not sent to Telegram, which is fine.
+        sys.__stdout__.write(f"  -> Warning: Could not check for Telegram commands: {e}\n")
+    except Exception as e:
+        sys.__stdout__.write(f"  -> Error processing Telegram commands: {e}\n")
+
+
 def validate_timezone():
     """Validates local time against an external time source."""
     try:
@@ -241,25 +323,28 @@ def parse_inference_output(output_text):
 
 def format_alert_message(data):
     title = f"🚨 {data['quality']}-Star GBP/JPY {data['direction_text']} Setup Detected! 🚨"
+    # This is the main login/platform URL, which is more reliable.
+    oanda_url = "https://trade.oanda.com/"
     message = (
         f"*Predicted R:R*: {data['rr']:.2f}\n"
         f"*SL Hit Probability*: {data['sl_prob']:.1%}\n"
         f"-------------------------------------\n"
         f"*Entry*: ~{data['entry']:.5f}\n"
         f"*Stop Loss*: ~{data['sl']:.5f} ({data['sl_reason']})\n"
-        f"*Take Profit*: ~{data['tp']:.5f}"
+        f"*Take Profit*: ~{data['tp']:.5f}\n"
+        f"-------------------------------------\n"
+        f"Opened OANDA live Paper Trading position -> *Monitor Position*: {oanda_url}"
     )
     return title, message
 
 @retry(
-         stop=stop_after_attempt(5),  # Increased retries
+         stop=stop_after_attempt(5),
          wait=wait_exponential(multiplier=1, min=2, max=15),
          retry=retry_if_exception_type(Exception),
          before_sleep=lambda retry_state: print(f"Retrying Telegram notification send (attempt {retry_state.attempt_number})...")
      )
 def send_telegram_notification(title, message):
          url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-         # Simplified escaping to avoid MarkdownV2 issues
          escape_chars = ['*', '_', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
          escaped_title = title
          escaped_message = message
@@ -273,7 +358,7 @@ def send_telegram_notification(title, message):
              "disable_notification": False
          }
          try:
-             response = requests.post(url, json=payload, timeout=15)  # Increased timeout
+             response = requests.post(url, json=payload, timeout=15)
              response.raise_for_status()
              print(f"  -> Telegram response: {response.json()}")
              return response.json()
@@ -281,13 +366,22 @@ def send_telegram_notification(title, message):
              print(f"  -> Detailed Telegram error: {type(e).__name__}: {str(e)}")
              raise
 
-def send_desktop_notification(title, message):
+def send_desktop_notification(title, message, parsed_data):
+    # Create a shorter, summarized message for the desktop pop-up
+    desktop_summary = (
+        f"Quality: {parsed_data['quality']} Stars\n"
+        f"R:R: {parsed_data['rr']:.2f}\n"
+        f"SL Prob: {parsed_data['sl_prob']:.1%}\n"
+        f"Check Telegram for full details."
+    )
     try:
-        notification.notify(title=title, message=message, app_name='GBP/JPY Trading Assistant', timeout=20)
+        # Use the short summary for the desktop notification
+        notification.notify(title=title, message=desktop_summary, app_name='GBP/JPY Trading Assistant', timeout=20)
         print("  -> Desktop Notification Sent!")
     except Exception as e:
         print(f"  -> Error sending desktop notification: {e}")
     try:
+        # Use the full, original message for the Telegram notification
         send_telegram_notification(title, message)
         print("  -> Telegram Notification Sent!")
     except Exception as e:
@@ -344,6 +438,9 @@ def run_live_assistant():
 
     while True:
         try:
+            # --- NEW: Check for Telegram commands at the start of each loop ---
+            process_telegram_commands()
+
             current_time = validate_timezone()
             is_trading_session = (current_time.hour >= TRADING_START_HOUR) or (current_time.hour < TRADING_END_HOUR)
 
@@ -392,7 +489,7 @@ def run_live_assistant():
                             outcome_rr = (close_price - entry_price) / risk_per_share * trade_direction if risk_per_share > 0 else 0.0
                             notes = "Closed by RL Agent"
                             log_prediction(
-                                data={},  # Empty dict since parsed_data may not be available
+                                data={},
                                 timestamp=validate_timezone(),
                                 trade_id=trade_id,
                                 update=True,
@@ -421,7 +518,7 @@ def run_live_assistant():
                             )
                             if is_high_quality_setup:
                                 title, message = format_alert_message(parsed_data)
-                                send_desktop_notification(title, message)
+                                send_desktop_notification(title, message, parsed_data)
                                 
                                 print("  -> High-quality setup found. Preparing to send order to OANDA...")
                                 current_balance = broker.get_account_balance()
@@ -448,11 +545,12 @@ def run_live_assistant():
                                         print(f"  -> Risk Amount: ${risk_amount_usd:,.2f} ({RISK_PER_TRADE_PERCENT:.0%})")
                                         print(f"  -> Calculated Position Size: {position_size} units")
                                         response = broker.create_market_order(
-                                            instrument="GBP_JPY",
-                                            units=units,
-                                            sl_price=parsed_data['sl'],
-                                            tp_price=parsed_data['tp']
+                                             instrument="GBP_JPY",
+                                             units=units,
+                                             sl_price=parsed_data['sl'],
+                                             tp_price=parsed_data['tp']
                                         )
+
                                         trade_id = response.get('orderFillTransaction', {}).get('tradeOpened', {}).get('tradeID') if response else None
                                         log_prediction(parsed_data, current_time, trade_id=trade_id)
                                     else:
