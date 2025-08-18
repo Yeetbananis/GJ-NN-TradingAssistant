@@ -36,7 +36,7 @@ TIMEZONE = 'America/Los_Angeles'
 MIN_QUALITY = 4
 MAX_SL_PROB = 0.30
 MIN_RR = 2.5
-SLEEP_INTERVAL_ACTIVE = 300
+SLEEP_INTERVAL_ACTIVE = 180
 SLEEP_INTERVAL_INACTIVE = 900
 DATA_CACHE_1H = PROJECT_ROOT / "data/cache/GBPJPY=X_1h_cache.csv"
 DATA_CACHE_5M = PROJECT_ROOT / "data/cache/GBPJPY=X_5m_cache.csv"
@@ -314,9 +314,16 @@ def parse_inference_output(output_text):
         sl = float(re.search(r"Stop Loss:\s*~\s*([\d\.]+)", output_text).group(1))
         tp = float(re.search(r"Take Profit:\s*~\s*([\d\.]+)", output_text).group(1))
         sl_reason = re.search(r"Stop Loss:.*?\((.*?)\)", output_text).group(1)
+        
+        # --- ADD THESE TWO LINES ---
+        support = float(re.search(r"Nearest Support:\s*~\s*([\d\.]+)", output_text).group(1))
+        resistance = float(re.search(r"Nearest Resistance:\s*~\s*([\d\.]+)", output_text).group(1))
+        
         return {
             "direction_text": direction_text, "quality": quality, "rr": rr, "sl_prob": sl_prob,
-            "entry": entry, "sl": sl, "tp": tp, "sl_reason": sl_reason
+            "entry": entry, "sl": sl, "tp": tp, "sl_reason": sl_reason,
+            # --- AND ADD THESE TWO ITEMS TO THE DICTIONARY ---
+            "support": support, "resistance": resistance
         }
     except (AttributeError, IndexError, ValueError):
         return None
@@ -420,6 +427,39 @@ def log_prediction(data, timestamp, trade_id=None, update=False, outcome_rr=None
 def run_live_assistant():
     print("--- GBP/JPY Live Trading Assistant (OANDA Integrated) ---")
     print(f"Alert Rules: Quality >= {MIN_QUALITY} Stars | R:R >= {MIN_RR} | SL Prob <= {MAX_SL_PROB*100}%")
+    # ---  Model Version Selection ---
+    models_dir = PROJECT_ROOT / "models"
+    available_versions = []
+    # Find all model files and extract their version numbers
+    for model_file in sorted(models_dir.glob('gbpjpy_assistant_v*.pth')):
+        match = re.search(r'v(\d+)\.pth', model_file.name)
+        if match:
+            available_versions.append(int(match.group(1)))
+
+    if not available_versions:
+        print("❌ ERROR: No trained models (e.g., gbpjpy_assistant_v1.pth) found in the /models directory.")
+        print("   Please run the training script first: python src/run_assistant.py train")
+        return
+
+    print("\n[Available Model Versions]")
+    for version in available_versions:
+        print(f"  - {version}")
+
+    selected_version = None
+    while True:
+        try:
+            user_input = input("➡️  Please select a model version to use for this session: ")
+            choice = int(user_input)
+            if choice in available_versions:
+                selected_version = choice
+                break
+            else:
+                print(f"❌ Invalid selection. Please choose from the available versions: {available_versions}")
+        except ValueError:
+            print("❌ Invalid input. Please enter a number.")
+    
+    print(f"\n[OK] Live assistant will use Model v{selected_version} for trade detection.")
+    # --- END: Model Version Selection ---
     
     broker = BrokerConnector()
     if not broker.client:
@@ -503,7 +543,7 @@ def run_live_assistant():
                 else:
                     python_executable = sys.executable
                     process = subprocess.run(
-                        [python_executable, script_path, 'infer'],
+                        [python_executable, script_path, 'infer', '-v', str(selected_version)],
                         capture_output=True, text=True, check=False, encoding='utf-8'
                     )
                     
@@ -516,6 +556,7 @@ def run_live_assistant():
                                 parsed_data['rr'] >= MIN_RR and
                                 parsed_data['sl_prob'] <= MAX_SL_PROB
                             )
+                            print(f"  -> Key Levels: Support=~{parsed_data['support']:.3f}, Resistance=~{parsed_data['resistance']:.3f}")
                             if is_high_quality_setup:
                                 title, message = format_alert_message(parsed_data)
                                 send_desktop_notification(title, message, parsed_data)

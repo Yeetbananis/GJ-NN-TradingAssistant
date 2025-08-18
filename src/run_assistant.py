@@ -21,47 +21,80 @@ import argparse
 # --- Part 1: Configuration ---
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LABEL_FILE = PROJECT_ROOT / "data/labels/manual_labels.csv"
-MODEL_SAVE_PATH = PROJECT_ROOT / "models/gbpjpy_assistant_v1.pth"
-SCALER_SAVE_PATH = PROJECT_ROOT / "models/scaler.pkl"
-PROCESSED_DATA_DIR = PROJECT_ROOT / "data/processed_for_training"
-
+models_dir = PROJECT_ROOT / "models"
+processed_data_base_dir = PROJECT_ROOT / "data"
+base_name = "gbpjpy_assistant"
+version = 1
+while True:
+    # We use the model file as the primary check to see if a version exists
+    model_path_candidate = models_dir / f"{base_name}_v{version}.pth"
+    if not model_path_candidate.exists():
+        # If the model file for this version doesn't exist, this number is free.
+        # We now define all the paths for this new version.
+        MODEL_SAVE_PATH = model_path_candidate
+        SCALER_SAVE_PATH = models_dir / f"scaler_v{version}.pkl"
+        PROCESSED_DATA_DIR = processed_data_base_dir / f"processed_for_training_v{version}"
+        
+        # This message will only appear when you run in 'train' mode
+        print("="*60)
+        print(f"[OK] This training run will be saved as VERSION {version}")
+        print(f"   - Model:    {MODEL_SAVE_PATH.name}")
+        print(f"   - Scaler:   {SCALER_SAVE_PATH.name}")
+        print(f"   - Data Dir: {PROCESSED_DATA_DIR.name}")
+        print("="*60)
+        break
+    # If v1 exists, try v2, and so on.
+    version += 1
 # Model Hyperparameters
 SEQUENCE_LENGTH = 24
 BATCH_SIZE = 16
 EPOCHS = 200
 PATIENCE = 10
 LEARNING_RATE = 0.001
-HIDDEN_SIZE = 64
+HIDDEN_SIZE = 128
 # NOTE: This unrolled model uses 1 layer for simplicity and SHAP compatibility
 NUM_LAYERS = 1
 DROPOUT = 0 # No dropout for a single layer LSTM
 
 # --- Part 2: All Necessary Functions and Classes ---
 
-def load_and_preprocess_data(period_1h="2y", period_5m="59d"):
-    # (This function is correct, included for completeness)
-    print("Loading/Downloading raw data...")
-    raw_data_dir = PROJECT_ROOT / "data/raw"
-    raw_data_dir.mkdir(parents=True, exist_ok=True)
-    path_1h = raw_data_dir / "GBPJPY=X_1h.csv"
-    path_5m = raw_data_dir / "GBPJPY=X_5m.csv"
+def load_and_preprocess_data(period_1h="5d", period_5m="3d"):
+    """
+    This function unconditionally downloads fresh 5m and 1h data from yfinance
+    every time it is called. It also robustly handles potential data format
+    errors from the API.
+    """
+    print("Downloading fresh 5m and 1h data for inference...")
     try:
-        if not path_1h.exists():
-            df_1h = yf.download("GBPJPY=X", period=period_1h, interval="1h", auto_adjust=False); df_1h.to_csv(path_1h)
-        else: df_1h = pd.read_csv(path_1h, index_col=0)
-        if not path_5m.exists():
-            df_5m = yf.download("GBPJPY=X", period=period_5m, interval="5m", auto_adjust=False); df_5m.to_csv(path_5m)
-        else: df_5m = pd.read_csv(path_5m, index_col=0)
+        # Step 1: Unconditionally download the latest data every time.
+        df_1h = yf.download("GBPJPY=X", period=period_1h, interval="1h", auto_adjust=False)
+        df_5m = yf.download("GBPJPY=X", period=period_5m, interval="5m", auto_adjust=False)
+
+        if df_1h.empty or df_5m.empty:
+            print("ERROR: yfinance returned an empty dataframe. Data may be unavailable.")
+            return None, None
+            
     except Exception as e:
-        print(f"Error downloading or loading raw data: {e}"); return None, None
+        print(f"ERROR: Could not download data from yfinance: {e}")
+        return None, None
+    
     processed_dfs = []
-    for df_original in [df_1h, df_5m]:
+    dataframes_to_process = {"1h": df_1h, "5m": df_5m}
+
+    for name, df_original in dataframes_to_process.items():
         df_clean = df_original[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
         df_clean.columns = ['open', 'high', 'low', 'close', 'volume']
-        df_clean.index = pd.to_datetime(df_clean.index, utc=True)
+        
+        # Step 2: Fix the DateParseError.
+        # The 'errors='coerce'' argument will turn any unparseable rows (like the bad "Ticker" row)
+        # into NaT (Not a Time), which are then immediately removed by the subsequent dropna().
+        df_clean.index = pd.to_datetime(df_clean.index, utc=True, errors='coerce')
+        df_clean.dropna(inplace=True)
+
         df_clean = df_clean[~df_clean.index.duplicated(keep='first')]
-        processed_dfs.append(df_clean.dropna())
-    print("Raw data processed successfully.")
+        processed_dfs.append(df_clean)
+    
+    print("[OK] Data processed successfully.")
     return processed_dfs[0], processed_dfs[1]
 
 def calculate_atr(df, period=14):
@@ -103,9 +136,9 @@ def add_key_level_features(df_5m, df_1h):
     df['sup_1_price'] = sup_prices
     df['dist_to_res_1'] = (df['res_1_price'] / df['close']) - 1
     df['dist_to_sup_1'] = (df['sup_1_price'] / df['close']) - 1
-    return df.dropna()
+    return df.ffill().dropna()
 
-# *** THE FOOLPROOF FIX: Replace the MultiTaskLSTM class with this version ***
+
 class MultiTaskLSTM(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, dropout):
         super(MultiTaskLSTM, self).__init__()
@@ -142,10 +175,10 @@ class MultiTaskLSTM(nn.Module):
         
         return torch.cat([direction_pred, quality_pred, reward_ratio_pred, sl_prob_pred], dim=1)
 
-def do_training():
+def do_training(args):
     print("\n--- MODE: TRAINING ---")
     # 1. Data Loading & Feature Engineering
-    df_1h, df_5m = load_and_preprocess_data()
+    df_1h, df_5m = load_and_preprocess_data(period_1h="730d", period_5m="59d")
     if df_1h is None: return
     feature_df = add_key_level_features(df_5m, df_1h)
     label_df = pd.read_csv(LABEL_FILE)
@@ -191,10 +224,20 @@ def do_training():
     PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
     np.save(PROCESSED_DATA_DIR / 'X_train.npy', X)
     
-    X_train, X_val, y_train_idx, y_val_idx = train_test_split(X, np.arange(len(X)), test_size=0.2, random_state=42)
-    y_train = {key: val[y_train_idx] for key, val in y.items()}
-    y_val = {key: val[y_val_idx] for key, val in y.items()}
-    
+    if args.train_indices_path and args.val_indices_path:
+        print("[OK] Loading pre-defined train/validation indices for cross-validation fold.")
+        train_idx = np.load(args.train_indices_path)
+        val_idx = np.load(args.val_indices_path)
+        X_train, X_val = X[train_idx], X[val_idx]
+        y_train = {key: val[train_idx] for key, val in y.items()}
+        y_val = {key: val[val_idx] for key, val in y.items()}
+    else:
+        # This is the original logic, runs if no indices are provided
+        print("[OK] Performing standard train/validation split.")
+        X_train, X_val, y_train_idx, y_val_idx = train_test_split(X, np.arange(len(X)), test_size=0.2, random_state=42)
+        y_train = {key: val[y_train_idx] for key, val in y.items()}
+        y_val = {key: val[y_val_idx] for key, val in y.items()}
+        
     class TradingDataset(Dataset):
         def __init__(self, X_data, y_data):
             self.X = torch.tensor(X_data, dtype=torch.float32)
@@ -270,25 +313,62 @@ def do_training():
             
     print("--- Training Complete ---")
 
-def do_inference():
+def do_inference(version_to_load=None):
     print("\n--- MODE: INFERENCE ---")
 
-    # --- NEW: Force redownload of raw data for inference ---
-    print("Clearing old raw data to ensure freshness...")
-    try:
-        (PROJECT_ROOT / "data/raw/GBPJPY=X_1h.csv").unlink(missing_ok=True)
-        (PROJECT_ROOT / "data/raw/GBPJPY=X_5m.csv").unlink(missing_ok=True)
-    except Exception as e:
-        print(f"Warning: Could not delete old raw data files. {e}")
+    # --- Load Specific or Latest Model Version ---
+    models_dir = PROJECT_ROOT / "models"
+    processed_data_base_dir = PROJECT_ROOT / "data"
+    base_name = "gbpjpy_assistant"
+    target_version = 0
+
+    if version_to_load is not None:
+        # Case 1: A specific version was requested by the user
+        print(f"Attempting to load specified artifacts: VERSION {version_to_load}")
+        model_path_candidate = models_dir / f"{base_name}_v{version_to_load}.pth"
+        if model_path_candidate.exists():
+            target_version = version_to_load
+        else:
+            print(f"ERROR: Version {version_to_load} not found. Please check the /models directory.")
+            return
+    else:
+        # Case 2: No version was specified, so we find the latest one
+        print("No version specified. Finding the latest available model...")
+        version = 1
+        latest_version = 0
+        while True:
+            model_path_candidate = models_dir / f"{base_name}_v{version}.pth"
+            if model_path_candidate.exists():
+                latest_version = version
+                version += 1
+            else:
+                break # Stop when we find a version number that doesn't exist
+        
+        if latest_version > 0:
+            target_version = latest_version
+        else:
+            print("ERROR: No trained models found. Please run 'train' mode first.")
+            return
+
+    # Define all artifact paths based on the determined target_version
+    MODEL_SAVE_PATH = models_dir / f"{base_name}_v{target_version}.pth"
+    SCALER_SAVE_PATH = models_dir / f"scaler_v{target_version}.pkl"
+    PROCESSED_DATA_DIR = processed_data_base_dir / f"processed_for_training_v{target_version}"
+    
+    print(f"[OK] Loading artifacts for VERSION {target_version}")
+    print(f"   - Model:    {MODEL_SAVE_PATH.name}")
+    print(f"   - Scaler:   {SCALER_SAVE_PATH.name}")
+    print(f"   - Data Dir: {PROCESSED_DATA_DIR.name}")
     
     # 1. Load artifacts
     try:
         with open(SCALER_SAVE_PATH, 'rb') as f: scaler = pickle.load(f)
         X_train = np.load(PROCESSED_DATA_DIR / 'X_train.npy')
     except FileNotFoundError:
-        print(f"ERROR: Model/scaler not found. Please run 'train' mode first: python run_assistant.py train")
+        print(f"ERROR: Could not find artifacts for Version {target_version}. The training run may have been incomplete.")
         return
 
+    # (The rest of the function for loading data, making predictions, and SHAP analysis remains exactly the same)
     df_1h, df_5m = load_and_preprocess_data(period_1h="5d", period_5m="3d")
     if df_1h is None: return
     feature_df = add_key_level_features(df_5m, df_1h)
@@ -315,7 +395,6 @@ def do_inference():
     # 4. Prediction
     prediction_tensor = model(input_tensor)
         
-    
     # 5. SHAP Explanation
     print("Calculating SHAP values...")
     background = torch.tensor(X_train[np.random.choice(X_train.shape[0], min(20, len(X_train)), replace=False)], dtype=torch.float32).to(device)
@@ -343,7 +422,7 @@ def do_inference():
     direction_text = "Buy" if dir_pred > 0 else "Sell"
 
     print("\n" + "="*75)
-    print("--- Live Trading Assistant Prediction ---")
+    print(f"--- Live Trading Assistant Prediction (Using Model v{target_version}) ---")
     print(f"Timestamp: {last_sequence_df.index[-1].strftime('%Y-%m-%d %H:%M:%S %Z')}")
     print("\nPrediction:")
     print(f"  - Direction Bias:     {dir_pred:.2f} ({direction_text})")
@@ -382,12 +461,53 @@ def do_inference():
     explain_output("Direction", shap_values[:, :, :, 0], "more TOWARDS BUY", "more TOWARDS SELL")
     explain_output(f"Quality ({predicted_star} Stars)", shap_values[:, :, :, 1 + (predicted_star - 1)], "HIGHER", "LOWER")
     explain_output("SL Probability", shap_values[:, :, :, 7], "HIGHER", "LOWER")
+
+    print("\nKey Levels:")
+    print(f"  - Nearest Support:    ~{latest_data['sup_1_price']:.5f}")
+    print(f"  - Nearest Resistance: ~{latest_data['res_1_price']:.5f}")
         
     print("="*75 + "\n")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="GBP/JPY Trading Assistant")
-    parser.add_argument('mode', choices=['train', 'infer'], help="The mode to run the script in: 'train' or 'infer'")
+    subparsers = parser.add_subparsers(dest='mode', required=True, help='Available modes')
+
+    # --- UPGRADED TRAIN PARSER ---
+    train_parser = subparsers.add_parser('train', help="Train a new version of the model.")
+    # Add arguments for file paths
+    train_parser.add_argument('--model-path', type=str, default=None, help="Override default model save path.")
+    train_parser.add_argument('--scaler-path', type=str, default=None, help="Override default scaler save path.")
+    train_parser.add_argument('--data-dir', type=str, default=None, help="Override default processed data directory.")
+    # Add arguments for hyperparameters
+    train_parser.add_argument('--lr', type=float, default=LEARNING_RATE, help="Set the learning rate.")
+    train_parser.add_argument('--batch-size', type=int, default=BATCH_SIZE, help="Set the batch size.")
+    train_parser.add_argument('--hidden-size', type=int, default=HIDDEN_SIZE, help="Set the LSTM hidden layer size.")
+
+    train_parser.add_argument('--train-indices-path', type=str, default=None, help="Path to .npy file with training indices.")
+    train_parser.add_argument('--val-indices-path', type=str, default=None, help="Path to .npy file with validation indices.")
+
+    # --- INFER PARSER ---
+    infer_parser = subparsers.add_parser('infer', help="Run inference using a trained model.")
+    infer_parser.add_argument('-v', '--version', type=int, default=None, help="Specify model version to load. Defaults to the latest.")
+
     args = parser.parse_args()
-    if args.mode == 'train': do_training()
-    elif args.mode == 'infer': do_inference()
+
+    if args.mode == 'train':
+        # --- NEW: Overwrite hyperparameters if provided ---
+        # This allows an external script to control the training settings.
+        LEARNING_RATE = args.lr
+        BATCH_SIZE = args.batch_size
+        HIDDEN_SIZE = args.hidden_size
+        
+        # This logic for overriding file paths remains the same
+        if args.model_path:
+            print("[OK] Overriding default save paths with provided arguments.")
+            MODEL_SAVE_PATH = Path(args.model_path)
+            SCALER_SAVE_PATH = Path(args.scaler_path)
+            PROCESSED_DATA_DIR = Path(args.data_dir)
+            PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        
+        do_training(args)
+
+    elif args.mode == 'infer':
+        do_inference(version_to_load=args.version)
