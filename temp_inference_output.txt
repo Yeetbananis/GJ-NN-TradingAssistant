@@ -1,0 +1,75 @@
+
+--- MODE: INFERENCE ---
+Attempting to load specified artifacts: VERSION 3
+[OK] Loading artifacts for VERSION 3
+   - Model:    gbpjpy_assistant_v3.pth
+   - Scaler:   scaler_v3.pkl
+   - Data Dir: processed_for_training_v3
+Downloading fresh 5m and 1h data for inference...
+[OK] Data processed successfully.
+Engineering 'Key Level' features...
+Finding major S/R zones from historical data...
+Calculating multi-timeframe Volume POCs...
+  -> Detected zero volume from yfinance. Calculating 'Price Action Volume' as a proxy.
+Engineering 'Key Level' features...
+Finding major S/R zones from historical data...
+Calculating multi-timeframe Volume POCs...
+  -> Detected zero volume from yfinance. Calculating 'Price Action Volume' as a proxy.
+Calculating SHAP values...
+
+===========================================================================
+--- Live Trading Assistant Prediction (Using Model v3) ---
+Timestamp: 2025-09-03 21:15:00 PDT
+
+Prediction:
+  - Direction Bias:     -0.08 (Sell)
+  - Predicted Quality:  3 Stars
+  - Predicted R:R:      3.08
+  - SL Hit Probability: 13.26%
+
+Suggested Trade Parameters:
+  - Entry Price:        ~199.07899
+  - Stop Loss:          ~199.57215 (Reason: Based on N/A)
+  - Take Profit:        ~197.55943 (Reason: Calculated from Predicted 3.08 R:R)
+
+--- Top 5 Factors Influencing R:R ---
+  - hour                 ( 19.2%) | Pushed R:R LOWER
+  - dist_to_res_1        ( 18.0%) | Pushed R:R LOWER
+  - pdh                  ( 13.6%) | Pushed R:R HIGHER
+  - session_low          ( 11.4%) | Pushed R:R HIGHER
+  - session_high         (  6.3%) | Pushed R:R LOWER
+
+--- Top 5 Factors Influencing Direction ---
+  - hour                 ( 19.1%) | Pushed Direction more TOWARDS SELL
+  - dist_to_res_1        ( 18.0%) | Pushed Direction more TOWARDS SELL
+  - pdh                  ( 13.6%) | Pushed Direction more TOWARDS BUY
+  - session_low          ( 11.4%) | Pushed Direction more TOWARDS BUY
+  - session_high         (  6.3%) | Pushed Direction more TOWARDS SELL
+
+--- Top 5 Factors Influencing Quality (3 Stars) ---
+  - hour                 ( 19.1%) | Pushed Quality (3 Stars) HIGHER
+  - dist_to_res_1        ( 18.0%) | Pushed Quality (3 Stars) HIGHER
+  - pdh                  ( 13.6%) | Pushed Quality (3 Stars) LOWER
+  - session_low          ( 11.4%) | Pushed Quality (3 Stars) LOWER
+  - session_high         (  6.3%) | Pushed Quality (3 Stars) HIGHER
+
+--- Top 5 Factors Influencing SL Probability ---
+  - hour                 ( 19.1%) | Pushed SL Probability HIGHER
+  - dist_to_res_1        ( 18.0%) | Pushed SL Probability HIGHER
+  - pdh                  ( 13.6%) | Pushed SL Probability LOWER
+  - session_low          ( 11.4%) | Pushed SL Probability LOWER
+  - session_high         (  6.3%) | Pushed SL Probability HIGHER
+
+Key Levels:
+  - Nearest 2 Price Supports:
+      - 198.41893
+      - 198.96600
+  - Nearest 2 Price Resistances:
+      - 199.55787
+      - 200.24899
+  - Volume Points of Control (POC):
+      - Monthly POC: ~198.99800 (Dominance: 4.7x Avg Vol)
+      - Weekly POC: ~198.96600 (Dominance: 3.9x Avg Vol)
+      - Daily POC: ~199.05100 (Dominance: 3.9x Avg Vol)
+===========================================================================
+

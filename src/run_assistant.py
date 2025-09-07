@@ -13,8 +13,10 @@ import yfinance as yf
 import pytz
 import shap
 import argparse
+import sys
 from sklearn.cluster import DBSCAN
 import traceback
+import ta
 
 # =====================================================================================
 # ALL-IN-ONE SCRIPT V3 - FINAL FOOLPROOF VERSION WITH UNROLLED LSTM FOR SHAP
@@ -320,143 +322,223 @@ class MultiTaskLSTM(nn.Module):
         
         return torch.cat([direction_pred, quality_pred, reward_ratio_pred, sl_prob_pred], dim=1)
 
-def do_training(args):
-    print("\n--- MODE: TRAINING ---")
-    # 1. Data Loading & Feature Engineering
-    df_1h, df_5m = load_and_preprocess_data(period_1h="730d", period_5m="59d")
-    if df_1h is None: return
-    feature_df, all_price_levels, poc_levels_dict = add_key_level_features(df_5m, df_1h, return_all_levels=True)
-    label_df = pd.read_csv(LABEL_FILE)
+def engineer_features(df_1h, df_5m):
+    """
+    Generate numeric features from 1h and 5m dataframes for training/inference.
+    Returns a DataFrame with numeric columns only.
+    """
+    print("Engineering numeric features...")
+    df = df_5m.copy()  # Use 5m data as primary, align with 1h where needed
     
-    # 2. Label Processing
+    # Calculate technical indicators (all numeric)
+    df['rsi_14'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
+    df['atr_14'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
+    macd = ta.trend.MACD(df['close'], window_fast=12, window_slow=26, window_sign=9)
+    df['macd'] = macd.macd()
+    df['macd_signal'] = macd.macd_signal()
+    df['ema_5'] = ta.trend.EMAIndicator(df['close'], window=5).ema_indicator()
+    df['ema_20'] = ta.trend.EMAIndicator(df['close'], window=20).ema_indicator()
+    
+    # Add price-based features
+    df['price_change'] = df['close'].pct_change()
+    df['volatility'] = df['close'].rolling(window=20).std()
+    
+    # Align 1h features (e.g., longer-term trend)
+    df_1h_resampled = df_1h.resample('5min').ffill().reindex(df.index, method='ffill')
+    df['ema_1h_50'] = ta.trend.EMAIndicator(df_1h_resampled['close'], window=50).ema_indicator()
+    
+    # Drop rows with NaN values from indicators
+    df = df.dropna()
+    
+    if df.empty:
+        print("ERROR: Feature DataFrame is empty after engineering.")
+        sys.exit(1)
+    
+    # Verify all columns are numeric
+    numeric_cols = [col for col in df.columns if df[col].dtype in [np.float64, np.float32, np.int64, np.int32]]
+    if len(numeric_cols) != len(df.columns):
+        non_numeric_cols = [col for col in df.columns if col not in numeric_cols]
+        print(f"ERROR: Non-numeric columns detected in features: {non_numeric_cols}")
+        sys.exit(1)
+    
+    print(f"Generated {len(numeric_cols)} numeric features.")
+    return df
+
+def do_training(args):
+    # Load data
+    df_1h, df_5m = load_and_preprocess_data(period_1h="730d", period_5m="60d")
+    if df_1h is None or df_5m is None:
+        print("ERROR: Could not load data for training.")
+        sys.exit(1)
+
+    # Feature Engineering
+    print("Engineering features...")
+    feature_df = engineer_features(df_1h, df_5m)
+
+    # Normalize features
+    cols_to_normalize = [col for col in feature_df.columns if feature_df[col].dtype in [np.float64, np.float32, np.int64, np.int32]]
+    if not cols_to_normalize:
+        print("ERROR: No numeric columns available for normalization.")
+        sys.exit(1)
+
+    feature_df = feature_df.copy()
+    feature_df[cols_to_normalize] = feature_df[cols_to_normalize].replace(['N/A', ''], np.nan)
+    rows_before = len(feature_df)
+    feature_df = feature_df.dropna(subset=cols_to_normalize)
+    rows_dropped = rows_before - len(feature_df)
+    if rows_dropped > 0:
+        print(f"  -> Dropped {rows_dropped} rows with missing values.")
+
+    if feature_df.empty:
+        print("ERROR: Feature DataFrame is empty after cleaning.")
+        sys.exit(1)
+
+    scaler = StandardScaler()
+    print("Normalizing features...")
+    try:
+        feature_df[cols_to_normalize] = scaler.fit_transform(feature_df[cols_to_normalize])
+    except Exception as e:
+        print(f"ERROR: Normalization failed: {e}")
+        sys.exit(1)
+
+    # Save scaler
+    with open(SCALER_SAVE_PATH, 'wb') as f:
+        pickle.dump(scaler, f)
+
+    # Load labels
+    label_df = pd.read_csv(LABEL_FILE)
     valid_labels = label_df.dropna(subset=['entry_price']).copy()
-    valid_labels = valid_labels[~valid_labels['date'].duplicated(keep='first')]
     valid_labels['date_parsed'] = pd.to_datetime(valid_labels['date'])
+
+    # Validate required label columns
+    required_columns = ['setup_quality', 'max_reward_ratio', 'outcome_sl_hit']
+    missing_columns = [col for col in required_columns if col not in valid_labels.columns]
+    if missing_columns:
+        print(f"ERROR: Missing required columns in {LABEL_FILE}: {', '.join(missing_columns)}")
+        print(f"Available columns: {', '.join(valid_labels.columns)}")
+        print("Please ensure manual_labels.csv contains 'setup_quality', 'max_reward_ratio', and 'outcome_sl_hit'.")
+        sys.exit(1)
+
+    # Align features and labels
     aligned_labels_list = []
     for _, label_row in valid_labels.iterrows():
         label_date = label_row['date_parsed'].date()
         entry_price = label_row['entry_price']
-        session_features = feature_df[(feature_df.index.date == label_date) & (feature_df['is_trading_session'] == 1)]
-        if session_features.empty: continue
+        session_features = feature_df[(feature_df.index.date == label_date)]
+        if session_features.empty:
+            continue
         closest_entry_time = (session_features['close'] - entry_price).abs().idxmin()
         new_label_entry = label_row.drop(['date', 'date_parsed']).to_dict()
         new_label_entry['timestamp'] = closest_entry_time
         aligned_labels_list.append(new_label_entry)
     aligned_labels_df = pd.DataFrame(aligned_labels_list).set_index('timestamp')
-    print(f"Successfully aligned {len(aligned_labels_df)} labels.")
 
-    # 3. Normalization and Scaler Saving
-    cols_to_exclude = ['pdh', 'pdl', 'session_high', 'session_low', 'res_1_price', 'sup_1_price']
-    cols_to_normalize = [col for col in feature_df.columns if col not in cols_to_exclude]
-    scaler = StandardScaler()
-    feature_df[cols_to_normalize] = scaler.fit_transform(feature_df[cols_to_normalize])
-    MODEL_SAVE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(SCALER_SAVE_PATH, 'wb') as f: pickle.dump(scaler, f)
-    print(f"Scaler saved to {SCALER_SAVE_PATH}")
+    # Verify aligned labels have required columns
+    if not all(col in aligned_labels_df.columns for col in required_columns):
+        print(f"ERROR: Aligned labels missing required columns: {', '.join([col for col in required_columns if col not in aligned_labels_df.columns])}")
+        sys.exit(1)
 
-    # 4. Sequence Creation & Data Splitting
-    X, y_dict = [], {col: [] for col in aligned_labels_df.columns}
+    # Prepare sequences
+    X, y_dict = [], {col: [] for col in required_columns}
     for timestamp, row in aligned_labels_df.iterrows():
         try:
             end_idx = feature_df.index.get_loc(timestamp)
             start_idx = end_idx - SEQUENCE_LENGTH + 1
-            if start_idx < 0: continue
-            X.append(feature_df.iloc[start_idx:end_idx + 1].values)
-            for col, val in row.items(): y_dict[col].append(val)
-        except KeyError: continue
-    X, y = np.array(X), {k: np.array(v) for k, v in y_dict.items()}
-    
-    PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    np.save(PROCESSED_DATA_DIR / 'X_train.npy', X)
-    
-    if args.train_indices_path and args.val_indices_path:
-        print("[OK] Loading pre-defined train/validation indices for cross-validation fold.")
-        train_idx = np.load(args.train_indices_path)
-        val_idx = np.load(args.val_indices_path)
-        X_train, X_val = X[train_idx], X[val_idx]
-        y_train = {key: val[train_idx] for key, val in y.items()}
-        y_val = {key: val[val_idx] for key, val in y.items()}
-    else:
-        # This is the original logic, runs if no indices are provided
-        print("[OK] Performing standard train/validation split.")
-        X_train, X_val, y_train_idx, y_val_idx = train_test_split(X, np.arange(len(X)), test_size=0.2, random_state=42)
-        y_train = {key: val[y_train_idx] for key, val in y.items()}
-        y_val = {key: val[y_val_idx] for key, val in y.items()}
-        
+            if start_idx < 0:
+                continue
+            sequence = feature_df.iloc[start_idx:end_idx + 1][cols_to_normalize].values
+            if sequence.shape[0] != SEQUENCE_LENGTH:
+                continue
+            X.append(sequence)
+            for col in required_columns:
+                y_dict[col].append(row[col])
+        except Exception as e:
+            print(f"Warning: Skipping label at {timestamp} due to error: {e}")
+            continue
+
+    if not X:
+        print("ERROR: No valid sequences for training.")
+        sys.exit(1)
+
+    X = np.array(X)
+    try:
+        y = np.array([y_dict['setup_quality'], y_dict['max_reward_ratio'], y_dict['outcome_sl_hit']]).T
+    except KeyError as e:
+        print(f"ERROR: Failed to create label array: {e}")
+        sys.exit(1)
+
+    # Split data
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # Create dataset and dataloader
     class TradingDataset(Dataset):
-        def __init__(self, X_data, y_data):
-            self.X = torch.tensor(X_data, dtype=torch.float32)
-            self.y_dir = torch.tensor(y_data['trade_direction'], dtype=torch.float32).unsqueeze(1)
-            self.y_qual = torch.tensor(y_data['setup_quality'] - 1, dtype=torch.long)
-            self.y_rr = torch.tensor(y_data['max_reward_ratio'], dtype=torch.float32).unsqueeze(1)
-            self.y_sl = torch.tensor(y_data['outcome_sl_hit'], dtype=torch.float32).unsqueeze(1)
-        def __len__(self): return len(self.X)
+        def __init__(self, X, y):
+            self.X = torch.tensor(X, dtype=torch.float32)
+            self.y = torch.tensor(y, dtype=torch.float32)
+        def __len__(self):
+            return len(self.X)
         def __getitem__(self, idx):
-            return self.X[idx], (self.y_dir[idx], self.y_qual[idx], self.y_rr[idx], self.y_sl[idx])
+            return self.X[idx], self.y[idx]
 
-    train_ds = TradingDataset(X_train, y_train)
-    val_ds = TradingDataset(X_val, y_val)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE)
-    
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = MultiTaskLSTM(X.shape[2], HIDDEN_SIZE, NUM_LAYERS, DROPOUT).to(device)
-    loss_fns = {'direction': nn.MSELoss(), 'quality': nn.CrossEntropyLoss(), 'reward_ratio': nn.MSELoss(), 'sl_probability': nn.BCELoss()}
-    loss_weights = {'direction': 0.5, 'quality': 1.5, 'reward_ratio': 1.0, 'sl_probability': 1.0}
+    train_dataset = TradingDataset(X_train, y_train)
+    val_dataset = TradingDataset(X_val, y_val)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    # Define model
+    class TradingLSTM(nn.Module):
+        def __init__(self, input_size, hidden_size, num_layers):
+            super(TradingLSTM, self).__init__()
+            self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+            self.fc = nn.Linear(hidden_size, 3)  # Predicting setup_quality, max_reward_ratio, outcome_sl_hit
+        def forward(self, x):
+            _, (hn, _) = self.lstm(x)
+            return self.fc(hn[-1])
+
+    model = TradingLSTM(input_size=len(cols_to_normalize), hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS)
+    criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    
-    print(f"--- Starting Training on {device} ---")
-    best_val_loss = float('inf')
-    
-    # ** CHANGE 3: Add counter for early stopping **
-    epochs_no_improve = 0
 
+    # Training loop
+    best_val_loss = float('inf')
+    patience_counter = 0
     for epoch in range(EPOCHS):
         model.train()
-        # (Training loop logic for one epoch remains the same)
-        for features, labels_tuple in train_loader:
-            features = features.to(device)
-            preds = model(features)
-            pred_dir, pred_qual, pred_rr, pred_sl = preds[:,0:1], preds[:,1:6], preds[:,6:7], preds[:,7:8]
-            true_dir, true_qual, true_rr, true_sl = [lbl.to(device) for lbl in labels_tuple]
-            loss = (loss_weights['direction'] * loss_fns['direction'](pred_dir, true_dir) +
-                    loss_weights['quality'] * loss_fns['quality'](pred_qual, true_qual) +
-                    loss_weights['reward_ratio'] * loss_fns['reward_ratio'](pred_rr, true_rr) +
-                    loss_weights['sl_probability'] * loss_fns['sl_probability'](pred_sl, true_sl))
-            optimizer.zero_grad(); loss.backward(); optimizer.step()
-        
-        # (Validation loop logic remains mostly the same)
+        train_loss = 0
+        for X_batch, y_batch in train_loader:
+            optimizer.zero_grad()
+            output = model(X_batch)
+            loss = criterion(output, y_batch)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        train_loss /= len(train_loader)
+
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for features, labels_tuple in val_loader:
-                features = features.to(device)
-                preds = model(features)
-                pred_dir, pred_qual, pred_rr, pred_sl = preds[:,0:1], preds[:,1:6], preds[:,6:7], preds[:,7:8]
-                true_dir, true_qual, true_rr, true_sl = [lbl.to(device) for lbl in labels_tuple]
-                loss = (loss_weights['direction'] * loss_fns['direction'](pred_dir, true_dir) +
-                        loss_weights['quality'] * loss_fns['quality'](pred_qual, true_qual) +
-                        loss_weights['reward_ratio'] * loss_fns['reward_ratio'](pred_rr, true_rr) +
-                        loss_weights['sl_probability'] * loss_fns['sl_probability'](pred_sl, true_sl))
+            for X_batch, y_batch in val_loader:
+                output = model(X_batch)
+                loss = criterion(output, y_batch)
                 val_loss += loss.item()
+            val_loss /= len(val_loader)
 
-        avg_val_loss = val_loss / len(val_loader) if len(val_loader) > 0 else 0
-        print(f"Epoch {epoch+1}/{EPOCHS} | Val Loss: {avg_val_loss:.4f}")
-        
-        # ** CHANGE 4: Implement the early stopping logic **
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+        print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             torch.save(model.state_dict(), MODEL_SAVE_PATH)
-            print(f"  -> New best model saved (Val Loss: {avg_val_loss:.4f})")
-            epochs_no_improve = 0
+            print(f"New best model saved (Val Loss: {best_val_loss:.4f})")
+            patience_counter = 0
         else:
-            epochs_no_improve += 1
+            patience_counter += 1
+            if patience_counter >= PATIENCE:
+                print("Early stopping triggered.")
+                break
 
-        if epochs_no_improve >= PATIENCE:
-            print(f"\nEarly stopping triggered after {PATIENCE} epochs with no improvement.")
-            break
-            
-    print("--- Training Complete ---")
+    # Save processed data
+    feature_df.to_pickle(PROCESSED_DATA_DIR / "feature_df.pkl")
+    print(f"Training complete. Model saved to {MODEL_SAVE_PATH}")
+
 
 def do_inference(version_to_load=None):
     print("\n--- MODE: INFERENCE ---")
@@ -557,153 +639,143 @@ def do_inference(version_to_load=None):
     sequence_scaled[cols_to_scale] = scaler.transform(model_input_df[cols_to_scale])
     input_tensor = torch.tensor(sequence_scaled.values, dtype=torch.float32).unsqueeze(0).to(device)
 
-    # ... (The rest of the function for SHAP, predictions, and printing remains the same) ...
-    # 4. Prediction
-    prediction_tensor = model(input_tensor)
+    # Wrap the inference logic in a try-except to ensure clean exit
+    try:
+        # 4. Prediction
+        prediction_tensor = model(input_tensor)
         
-    # 5. SHAP Explanation
-    print("Calculating SHAP values...")
-    # Background for SHAP must also have the same number of features
-    if X_train.shape[2] != input_size:
-        print(f"  -> Warning: Shape of loaded X_train ({X_train.shape[2]}) does not match model input size ({input_size}). SHAP values may be unreliable.")
-        # Attempt to fix by padding/truncating, though this is not ideal
-        if X_train.shape[2] > input_size:
-            X_train = X_train[:, :, :input_size]
-        else:
-            padding = np.zeros((X_train.shape[0], X_train.shape[1], input_size - X_train.shape[2]))
-            X_train = np.concatenate([X_train, padding], axis=2)
+        # 5. SHAP Explanation
+        print("Calculating SHAP values...")
+        if X_train.shape[2] != input_size:
+            print(f"  -> Warning: Shape of loaded X_train ({X_train.shape[2]}) does not match model input size ({input_size}). SHAP values may be unreliable.")
+            # Attempt to fix by padding/truncating, though this is not ideal
+            if X_train.shape[2] > input_size:
+                X_train = X_train[:, :, :input_size]
+            else:
+                padding = np.zeros((X_train.shape[0], X_train.shape[1], input_size - X_train.shape[2]))
+                X_train = np.concatenate([X_train, padding], axis=2)
 
-    background = torch.tensor(X_train[np.random.choice(X_train.shape[0], min(20, len(X_train)), replace=False)], dtype=torch.float32).to(device)
-    explainer = shap.DeepExplainer(model, background)
-    shap_values = explainer.shap_values(input_tensor, check_additivity=False)
-    
-    def explain_output(output_name, shap_values_for_output, effect_positive="HIGHER", effect_negative="LOWER"):
-        shap_last_step = shap_values_for_output[0, -1, :]
-        total_abs_shap = np.sum(np.abs(shap_last_step))
-        top_indices = np.argsort(np.abs(shap_last_step))[::-1][:5]
-        print(f"\n--- Top 5 Factors Influencing {output_name} ---")
-        for i in top_indices:
-            feature_name = model_input_df.columns[i]
-            shap_value = float(shap_last_step[i])
-            percentage_contribution = (np.abs(shap_value) / total_abs_shap) * 100 if total_abs_shap > 0 else 0
-            effect = effect_positive if shap_value > 0 else effect_negative
-            print(f"  - {str(feature_name):<20} ({percentage_contribution:5.1f}%) | Pushed {output_name} {effect}")
-
-    # 6. Unpack Predictions and Display
-    dir_pred = prediction_tensor[:, 0].item()
-    qual_logits = prediction_tensor[:, 1:6]
-    rr_pred = prediction_tensor[:, 6].item()
-    sl_prob = prediction_tensor[:, 7].item()
-    predicted_star = torch.softmax(qual_logits, dim=1).argmax().item() + 1
-    direction_text = "Buy" if dir_pred > 0 else "Sell"
-
-    print("\n" + "="*75)
-    print(f"--- Live Trading Assistant Prediction (Using Model v{target_version}) ---")
-    print(f"Timestamp: {last_sequence_df.index[-1].strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    print("\nPrediction:")
-    print(f"  - Direction Bias:     {dir_pred:.2f} ({direction_text})")
-    print(f"  - Predicted Quality:  {predicted_star} Stars")
-    print(f"  - Predicted R:R:      {rr_pred:.2f}")
-    print(f"  - SL Hit Probability: {sl_prob * 100:.2f}%")
-
-    latest_data = last_sequence_df.iloc[-1]
-    entry_price = latest_data['close']
-    atr = latest_data['atr_14']
-    
-    print("\nSuggested Trade Parameters:")
-    sl_reason_text = "N/A"
-    if direction_text == "Buy":
-        stop_loss_price = latest_data['sup_1_price'] - atr * 0.25
-        risk_per_share = entry_price - stop_loss_price
-        take_profit_price = entry_price + (risk_per_share * rr_pred)
-        sl_reason_text = f"Based on {latest_data.get('sup_1_reason', 'Price Structure')}"
-    else: # Sell
-        stop_loss_price = latest_data['res_1_price'] + atr * 0.25
-        risk_per_share = stop_loss_price - entry_price
-        take_profit_price = entry_price - (risk_per_share * rr_pred)
-        sl_reason_text = f"Based on {latest_data.get('res_1_reason', 'Price Structure')}"
-    tp_reason_text = f"Calculated from Predicted {rr_pred:.2f} R:R"
-
-    print(f"  - Entry Price:        ~{entry_price:.5f}")
-    print(f"  - Stop Loss:          ~{stop_loss_price:.5f} (Reason: {sl_reason_text})")
-    print(f"  - Take Profit:        ~{take_profit_price:.5f} (Reason: {tp_reason_text})")
-    
-    explain_output("R:R", shap_values[:, :, :, 6], "HIGHER", "LOWER")
-    explain_output("Direction", shap_values[:, :, :, 0], "more TOWARDS BUY", "more TOWARDS SELL")
-    explain_output(f"Quality ({predicted_star} Stars)", shap_values[:, :, :, 1 + (predicted_star - 1)], "HIGHER", "LOWER")
-    explain_output("SL Probability", shap_values[:, :, :, 7], "HIGHER", "LOWER")
-
-    
-    # --- Final, Detailed Key Levels Output ---
-    print("\nKey Levels:")
-    current_price = latest_data['close']
-    
-    # Find and display the nearest 2 price structure supports
-    support_levels = [level for level in all_price_levels if level < current_price]
-    print("  - Nearest 2 Price Supports:")
-    for level in support_levels[-2:]:
-        print(f"      - {level:.5f}")
+        background = torch.tensor(X_train[np.random.choice(X_train.shape[0], min(20, len(X_train)), replace=False)], dtype=torch.float32).to(device)
+        explainer = shap.DeepExplainer(model, background)
+        shap_values = explainer.shap_values(input_tensor, check_additivity=False)
         
-    # Find and display the nearest 2 price structure resistances
-    resistance_levels = [level for level in all_price_levels if level > current_price]
-    print("  - Nearest 2 Price Resistances:")
-    for level in resistance_levels[:2]:
-        print(f"      - {level:.5f}")
+        def explain_output(output_name, shap_values_for_output, effect_positive="HIGHER", effect_negative="LOWER"):
+            shap_last_step = shap_values_for_output[0, -1, :]
+            total_abs_shap = np.sum(np.abs(shap_last_step))
+            top_indices = np.argsort(np.abs(shap_last_step))[::-1][:5]
+            print(f"\n--- Top 5 Factors Influencing {output_name} ---")
+            for i in top_indices:
+                feature_name = model_input_df.columns[i]
+                shap_value = float(shap_last_step[i])
+                percentage_contribution = (np.abs(shap_value) / total_abs_shap) * 100 if total_abs_shap > 0 else 0
+                effect = effect_positive if shap_value > 0 else effect_negative
+                print(f"  - {str(feature_name):<20} ({percentage_contribution:5.1f}%) | Pushed {output_name} {effect}")
+
+        # 6. Unpack Predictions and Display
+        dir_pred = prediction_tensor[:, 0].item()
+        qual_logits = prediction_tensor[:, 1:6]
+        rr_pred = prediction_tensor[:, 6].item()
+        sl_prob = prediction_tensor[:, 7].item()
+        predicted_star = torch.softmax(qual_logits, dim=1).argmax().item() + 1
+        direction_text = "Buy" if dir_pred > 0 else "Sell"
+
+        print("\n" + "="*75)
+        print(f"--- Live Trading Assistant Prediction (Using Model v{target_version}) ---")
+        print(f"Timestamp: {last_sequence_df.index[-1].strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        print("\nPrediction:")
+        print(f"  - Direction Bias:     {dir_pred:.2f} ({direction_text})")
+        print(f"  - Predicted Quality:  {predicted_star} Stars")
+        print(f"  - Predicted R:R:      {rr_pred:.2f}")
+        print(f"  - SL Hit Probability: {sl_prob * 100:.2f}%")
+
+        latest_data = last_sequence_df.iloc[-1]
+        entry_price = latest_data['close']
+        atr = latest_data['atr_14']
         
-    # Display the Volume Points of Control with their dominance
-    print("  - Volume Points of Control (POC):")
-    if poc_levels_dict:
-        for name, details in poc_levels_dict.items():
-            if details and details.get('price') is not None:
-                price = details['price']
-                volume = details.get('volume', 0)
-                avg_volume = details.get('avg_volume', 0)
-                # Calculate dominance: how many times greater is the POC volume than the average?
-                dominance = (volume / avg_volume) if avg_volume > 0 else 1.0
-                print(f"      - {name}: ~{price:.5f} (Dominance: {dominance:.1f}x Avg Vol)")
-    
+        print("\nSuggested Trade Parameters:")
+        sl_reason_text = "N/A"
+        if direction_text == "Buy":
+            stop_loss_price = latest_data['sup_1_price'] - atr * 0.25
+            risk_per_share = entry_price - stop_loss_price
+            take_profit_price = entry_price + (risk_per_share * rr_pred)
+            sl_reason_text = f"Based on {latest_data.get('sup_1_reason', 'Price Structure')}"
+        else: # Sell
+            stop_loss_price = latest_data['res_1_price'] + atr * 0.25
+            risk_per_share = stop_loss_price - entry_price
+            take_profit_price = entry_price - (risk_per_share * rr_pred)
+            sl_reason_text = f"Based on {latest_data.get('res_1_reason', 'Price Structure')}"
+        tp_reason_text = f"Calculated from Predicted {rr_pred:.2f} R:R"
+
+        print(f"  - Entry Price:        ~{entry_price:.5f}")
+        print(f"  - Stop Loss:          ~{stop_loss_price:.5f} (Reason: {sl_reason_text})")
+        print(f"  - Take Profit:        ~{take_profit_price:.5f} (Reason: {tp_reason_text})")
         
-    print("="*75 + "\n")
+        explain_output("R:R", shap_values[:, :, :, 6], "HIGHER", "LOWER")
+        explain_output("Direction", shap_values[:, :, :, 0], "more TOWARDS BUY", "more TOWARDS SELL")
+        explain_output(f"Quality ({predicted_star} Stars)", shap_values[:, :, :, 1 + (predicted_star - 1)], "HIGHER", "LOWER")
+        explain_output("SL Probability", shap_values[:, :, :, 7], "HIGHER", "LOWER")
+
+        print("\nKey Levels:")
+        current_price = latest_data['close']
+        
+        support_levels = [level for level in all_price_levels if level < current_price]
+        print("  - Nearest 2 Price Supports:")
+        for level in support_levels[-2:]:
+            print(f"      - {level:.5f}")
+        
+        resistance_levels = [level for level in all_price_levels if level > current_price]
+        print("  - Nearest 2 Price Resistances:")
+        for level in resistance_levels[:2]:
+            print(f"      - {level:.5f}")
+        
+        print("  - Volume Points of Control (POC):")
+        if poc_levels_dict:
+            for name, details in poc_levels_dict.items():
+                if details and details.get('price') is not None:
+                    price = details['price']
+                    volume = details.get('volume', 0)
+                    avg_volume = details.get('avg_volume', 0)
+                    dominance = (volume / avg_volume) if avg_volume > 0 else 1.0
+                    print(f"      - {name}: ~{price:.5f} (Dominance: {dominance:.1f}x Avg Vol)")
+        
+        print("="*75 + "\n")
+        
+        sys.exit(0)  # Explicitly exit with code 0 to indicate success
+    except Exception as e:
+        print(f"  -> Error in inference: {e}")
+        print(traceback.format_exc())
+        sys.exit(1)  # Exit with error code if an exception occurs
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="GBP/JPY Trading Assistant")
     subparsers = parser.add_subparsers(dest='mode', required=True, help='Available modes')
 
-    # --- UPGRADED TRAIN PARSER ---
     train_parser = subparsers.add_parser('train', help="Train a new version of the model.")
-    # Add arguments for file paths
     train_parser.add_argument('--model-path', type=str, default=None, help="Override default model save path.")
     train_parser.add_argument('--scaler-path', type=str, default=None, help="Override default scaler save path.")
     train_parser.add_argument('--data-dir', type=str, default=None, help="Override default processed data directory.")
-    # Add arguments for hyperparameters
     train_parser.add_argument('--lr', type=float, default=LEARNING_RATE, help="Set the learning rate.")
     train_parser.add_argument('--batch-size', type=int, default=BATCH_SIZE, help="Set the batch size.")
     train_parser.add_argument('--hidden-size', type=int, default=HIDDEN_SIZE, help="Set the LSTM hidden layer size.")
-
     train_parser.add_argument('--train-indices-path', type=str, default=None, help="Path to .npy file with training indices.")
     train_parser.add_argument('--val-indices-path', type=str, default=None, help="Path to .npy file with validation indices.")
 
-    # --- INFER PARSER ---
     infer_parser = subparsers.add_parser('infer', help="Run inference using a trained model.")
     infer_parser.add_argument('-v', '--version', type=int, default=None, help="Specify model version to load. Defaults to the latest.")
 
     args = parser.parse_args()
 
     if args.mode == 'train':
-        # Allow hyperparameters to be overridden by command line
         LEARNING_RATE = args.lr
         BATCH_SIZE = args.batch_size
         HIDDEN_SIZE = args.hidden_size
 
-        # Check if custom paths are provided (for tuning) or use default dynamic versioning
         if args.model_path:
             print("[OK] Overriding default save paths for a tuning run.")
             MODEL_SAVE_PATH = Path(args.model_path)
             SCALER_SAVE_PATH = Path(args.scaler_path)
             PROCESSED_DATA_DIR = Path(args.data_dir)
         else:
-            # --- THIS IS THE MOVED LOGIC ---
-            # Default behavior: Find the next available version number
             models_dir = PROJECT_ROOT / "models"
             processed_data_base_dir = PROJECT_ROOT / "data"
             base_name = "gbpjpy_assistant"
@@ -723,7 +795,6 @@ if __name__ == '__main__':
                     break
                 version += 1
 
-        # Ensure directories exist before training
         MODEL_SAVE_PATH.parent.mkdir(parents=True, exist_ok=True)
         PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
         do_training(args)

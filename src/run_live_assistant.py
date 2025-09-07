@@ -304,28 +304,77 @@ def add_key_level_features(df_5m, df_1h):
     df['dist_to_sup_1'] = (df['sup_1_price'] / df['close']) - 1
     return df.dropna()
 
-def parse_inference_output(output_text):
+def parse_inference_output(stdout):
+    """Parse the inference output from run_assistant.py to extract trade parameters."""
     try:
-        direction_text = re.search(r"Direction Bias:.*?\((.*?)\)", output_text).group(1)
-        quality = int(re.search(r"Predicted Quality:\s*(\d+)", output_text).group(1))
-        rr = float(re.search(r"Predicted R:R:\s*([\d\.]+)", output_text).group(1))
-        sl_prob = float(re.search(r"SL Hit Probability:\s*([\d\.]+)%", output_text).group(1)) / 100.0
-        entry = float(re.search(r"Entry Price:\s*~\s*([\d\.]+)", output_text).group(1))
-        sl = float(re.search(r"Stop Loss:\s*~\s*([\d\.]+)", output_text).group(1))
-        tp = float(re.search(r"Take Profit:\s*~\s*([\d\.]+)", output_text).group(1))
-        sl_reason = re.search(r"Stop Loss:.*?\((.*?)\)", output_text).group(1)
-        
-        # --- ADD THESE TWO LINES ---
-        support = float(re.search(r"Nearest Support:\s*~\s*([\d\.]+)", output_text).group(1))
-        resistance = float(re.search(r"Nearest Resistance:\s*~\s*([\d\.]+)", output_text).group(1))
-        
-        return {
-            "direction_text": direction_text, "quality": quality, "rr": rr, "sl_prob": sl_prob,
-            "entry": entry, "sl": sl, "tp": tp, "sl_reason": sl_reason,
-            # --- AND ADD THESE TWO ITEMS TO THE DICTIONARY ---
-            "support": support, "resistance": resistance
+        # Initialize default values
+        parsed_data = {
+            'direction_text': None,
+            'quality': None,
+            'rr': None,
+            'sl_prob': None,
+            'entry': None,
+            'sl': None,
+            'tp': None,
+            'support': None,
+            'resistance': None,
+            'sl_reason': 'N/A'
         }
-    except (AttributeError, IndexError, ValueError):
+
+        # Extract direction bias
+        direction_match = re.search(r"Direction Bias:\s+([-]?\d+\.\d+)\s+\((Buy|Sell)\)", stdout)
+        if direction_match:
+            parsed_data['direction_text'] = direction_match.group(2)
+
+        # Extract quality
+        quality_match = re.search(r"Predicted Quality:\s+(\d+)\s+Stars", stdout)
+        if quality_match:
+            parsed_data['quality'] = int(quality_match.group(1))
+
+        # Extract R:R
+        rr_match = re.search(r"Predicted R:R:\s+(\d+\.\d+)", stdout)
+        if rr_match:
+            parsed_data['rr'] = float(rr_match.group(1))
+
+        # Extract SL probability
+        sl_prob_match = re.search(r"SL Hit Probability:\s+(\d+\.\d+)%", stdout)
+        if sl_prob_match:
+            parsed_data['sl_prob'] = float(sl_prob_match.group(1)) / 100
+
+        # Extract entry price
+        entry_match = re.search(r"Entry Price:\s+~(\d+\.\d+)", stdout)
+        if entry_match:
+            parsed_data['entry'] = float(entry_match.group(1))
+
+        # Extract stop loss price and reason
+        sl_match = re.search(r"Stop Loss:\s+~(\d+\.\d+)\s+\(Reason: ([^\)]+)\)", stdout)
+        if sl_match:
+            parsed_data['sl'] = float(sl_match.group(1))
+            parsed_data['sl_reason'] = sl_match.group(2)
+
+        # Extract take profit price
+        tp_match = re.search(r"Take Profit:\s+~(\d+\.\d+)", stdout)
+        if tp_match:
+            parsed_data['tp'] = float(tp_match.group(1))
+
+        # Extract key levels (support and resistance)
+        support_match = re.search(r"Nearest 2 Price Supports:.*?- (\d+\.\d+)", stdout, re.DOTALL)
+        resistance_match = re.search(r"Nearest 2 Price Resistances:.*?- (\d+\.\d+)", stdout, re.DOTALL)
+        if support_match:
+            parsed_data['support'] = float(support_match.group(1))
+        if resistance_match:
+            parsed_data['resistance'] = float(resistance_match.group(1))
+
+        # Check if all required fields are parsed
+        required_fields = ['direction_text', 'quality', 'rr', 'sl_prob', 'entry', 'sl', 'tp', 'support', 'resistance']
+        missing_fields = [field for field in required_fields if parsed_data[field] is None]
+        if missing_fields:
+            print(f"  -> Parsing error: Missing fields {missing_fields}")
+            return None
+
+        return parsed_data
+    except Exception as e:
+        print(f"  -> Parsing error: {e}")
         return None
 
 def format_alert_message(data):
@@ -542,65 +591,91 @@ def run_live_assistant():
 
                 else:
                     python_executable = sys.executable
-                    process = subprocess.run(
-                        [python_executable, script_path, 'infer', '-v', str(selected_version)],
-                        capture_output=True, text=True, check=False, encoding='utf-8'
-                    )
-                    
-                    if process.returncode == 0:
-                        parsed_data = parse_inference_output(process.stdout)
-                        if parsed_data:
-                            print(f"  -> LSTM Analysis Complete: Quality={parsed_data['quality']}*, R:R={parsed_data['rr']:.2f}")
-                            is_high_quality_setup = (
-                                parsed_data['quality'] >= MIN_QUALITY and
-                                parsed_data['rr'] >= MIN_RR and
-                                parsed_data['sl_prob'] <= MAX_SL_PROB
+                    script_path = os.path.abspath(os.path.join('src', 'run_assistant.py'))
+                    command = [python_executable, script_path, 'infer', '-v', str(selected_version)]
+                    temp_output_file = PROJECT_ROOT / "temp_inference_output.txt"
+                    try:
+                        with open(temp_output_file, 'w', encoding='utf-8') as f:
+                            process = subprocess.run(
+                                command,
+                                capture_output=True,
+                                text=True,
+                                check=False,
+                                encoding='utf-8',
+                                errors='replace',
+                                env=os.environ.copy(),
+                                cwd=str(PROJECT_ROOT)
                             )
-                            print(f"  -> Key Levels: Support=~{parsed_data['support']:.3f}, Resistance=~{parsed_data['resistance']:.3f}")
-                            if is_high_quality_setup:
-                                title, message = format_alert_message(parsed_data)
-                                send_desktop_notification(title, message, parsed_data)
-                                
-                                print("  -> High-quality setup found. Preparing to send order to OANDA...")
-                                current_balance = broker.get_account_balance()
-                                if current_balance:
-                                    try:
-                                        usdjpy_rate = yf.Ticker("USDJPY=X").history(period='1d')['Close'].iloc[-1]
-                                    except Exception:
-                                        print("  -> Warning: yfinance failed to fetch USD/JPY rate. Attempting OANDA API fallback...")
-                                        price_data = broker.get_current_price("USD_JPY")
-                                        if price_data and 'bid' in price_data and 'ask' in price_data:
-                                            usdjpy_rate = (float(price_data['bid']) + float(price_data['ask'])) / 2
-                                            print("  -> Fallback successful: USD/JPY rate from OANDA.")
-                                        else:
-                                            print("  -> ERROR: Could not fetch USD/JPY rate from OANDA. Aborting trade.")
-                                            continue
-                                    risk_amount_usd = current_balance * RISK_PER_TRADE_PERCENT
-                                    risk_per_unit_jpy = abs(parsed_data['entry'] - parsed_data['sl'])
-                                    if risk_per_unit_jpy > 0:
-                                        risk_per_unit_usd = risk_per_unit_jpy / usdjpy_rate
-                                        position_size = int(risk_amount_usd / risk_per_unit_usd)
-                                        direction = 1 if "Buy" in parsed_data['direction_text'] else -1
-                                        units = position_size * direction
-                                        print(f"  -> Account Balance: ${current_balance:,.2f}")
-                                        print(f"  -> Risk Amount: ${risk_amount_usd:,.2f} ({RISK_PER_TRADE_PERCENT:.0%})")
-                                        print(f"  -> Calculated Position Size: {position_size} units")
-                                        response = broker.create_market_order(
-                                             instrument="GBP_JPY",
-                                             units=units,
-                                             sl_price=parsed_data['sl'],
-                                             tp_price=parsed_data['tp']
-                                        )
-
-                                        trade_id = response.get('orderFillTransaction', {}).get('tradeOpened', {}).get('tradeID') if response else None
-                                        log_prediction(parsed_data, current_time, trade_id=trade_id)
+                            f.write(process.stdout)
+                        with open(temp_output_file, 'r', encoding='utf-8', errors='replace') as f:
+                            stdout_content = f.read()
+                        parsed_data = parse_inference_output(stdout_content)
+                        if parsed_data is None and process.returncode == 0:
+                            print(f"  -> No setup detected (parsing failed, check {temp_output_file})")
+                    except Exception as e:
+                        print(f"  -> No setup detected (subprocess error: {e})")
+                        parsed_data = None
+                    if parsed_data:
+                        print(f"  -> Setup: {parsed_data['direction_text']} | Quality={parsed_data['quality']}* | R:R={parsed_data['rr']:.2f} | SL Prob={parsed_data['sl_prob']*100:.1f}%")
+                        is_high_quality_setup = (
+                            parsed_data['quality'] >= MIN_QUALITY and
+                            parsed_data['rr'] >= MIN_RR and
+                            parsed_data['sl_prob'] <= MAX_SL_PROB
+                        )
+                        if is_high_quality_setup:
+                            print(f"  -> High-quality setup found:")
+                            print(f"     - Direction: {parsed_data['direction_text']}")
+                            print(f"     - Quality: {parsed_data['quality']} Stars")
+                            print(f"     - Predicted R:R: {parsed_data['rr']:.2f}")
+                            print(f"     - SL Hit Probability: {parsed_data['sl_prob']*100:.2f}%")
+                            print(f"     - Entry Price: ~{parsed_data['entry']:.5f}")
+                            print(f"     - Stop Loss: ~{parsed_data['sl']:.5f} ({parsed_data['sl_reason']})")
+                            print(f"     - Take Profit: ~{parsed_data['tp']:.5f}")
+                            print(f"     - Key Levels: Support=~{parsed_data['support']:.3f}, Resistance=~{parsed_data['resistance']:.3f}")
+                            title, message = format_alert_message(parsed_data)
+                            send_desktop_notification(title, message, parsed_data)
+                            
+                            print("  -> Preparing to send order to OANDA...")
+                            current_balance = broker.get_account_balance()
+                            if current_balance:
+                                try:
+                                    usdjpy_rate = yf.Ticker("USDJPY=X").history(period='1d')['Close'].iloc[-1]
+                                except Exception:
+                                    print("  -> Warning: yfinance failed to fetch USD/JPY rate. Attempting OANDA API fallback...")
+                                    price_data = broker.get_current_price("USD_JPY")
+                                    if price_data and 'bid' in price_data and 'ask' in price_data:
+                                        usdjpy_rate = (float(price_data['bid']) + float(price_data['ask'])) / 2
+                                        print("  -> Fallback successful: USD/JPY rate from OANDA.")
                                     else:
-                                        print("  -> ERROR: Risk per unit is zero. Aborting trade.")
+                                        print("  -> ERROR: Could not fetch USD/JPY rate from OANDA. Aborting trade.")
+                                        continue
+                                risk_amount_usd = current_balance * RISK_PER_TRADE_PERCENT
+                                risk_per_unit_jpy = abs(parsed_data['entry'] - parsed_data['sl'])
+                                if risk_per_unit_jpy > 0:
+                                    risk_per_unit_usd = risk_per_unit_jpy / usdjpy_rate
+                                    position_size = int(risk_amount_usd / risk_per_unit_usd)
+                                    direction = 1 if "Buy" in parsed_data['direction_text'] else -1
+                                    units = position_size * direction
+                                    print(f"  -> Account Balance: ${current_balance:,.2f}")
+                                    print(f"  -> Risk Amount: ${risk_amount_usd:,.2f} ({RISK_PER_TRADE_PERCENT:.0%})")
+                                    print(f"  -> Calculated Position Size: {position_size} units")
+                                    response = broker.create_market_order(
+                                        instrument="GBP_JPY",
+                                        units=units,
+                                        sl_price=parsed_data['sl'],
+                                        tp_price=parsed_data['tp']
+                                    )
+
+                                    trade_id = response.get('orderFillTransaction', {}).get('tradeOpened', {}).get('tradeID') if response else None
+                                    log_prediction(parsed_data, current_time, trade_id=trade_id)
                                 else:
-                                    print("  -> ERROR: Could not fetch account balance. Aborting trade.")
+                                    print("  -> ERROR: Risk per unit is zero. Aborting trade.")
+                            else:
+                                print("  -> ERROR: Could not fetch account balance. Aborting trade.")
+                        else:
+                            print(f"  -> Does not meet criteria (Quality >= {MIN_QUALITY}, R:R >= {MIN_RR}, SL Prob <= {MAX_SL_PROB*100:.1f}%)")
                     else:
-                        print("  -> Error: Inference script failed.")
-                        print(process.stderr)
+                        print("  -> No setup detected")
                 
                 time.sleep(SLEEP_INTERVAL_ACTIVE)
 
