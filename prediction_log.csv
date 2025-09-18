@@ -1,1 +1,3 @@
-Timestamp,Direction,PredictedQuality,PredictedRR,SLHitProbability,EntryPrice,StopLossPrice,TakeProfitPrice,SLReason,TradeID,ActualOutcomeRR,Notes
+version https://git-lfs.github.com/spec/v1
+oid sha256:113b4c1e1966145527753f846fa29a2c503f01db257202315339ed76e577b91d
+size 147
